@@ -64,8 +64,11 @@ func main() {
 ```
 
 ## Caveats
-
 - The provider requires Bluecat Address Manager 9.5.0 or later with the RESTful v2 API enabled
+- Record names should be relative to the zone (e.g., "www" for "www.example.com" in zone "example.com.")
+- Handling of Bluecat's linked records is not properly implemented yet. Networks and existing records to link A records and CNAMEs must already exist.
+
+## Features
 - Authentication sessions are automatically managed and tokens are cached for efficiency
 - The provider supports A, AAAA, CNAME, TXT, MX, NS, and SRV record types
-- Record names should be relative to the zone (e.g., "www" for "www.example.com" in zone "example.com.")
+
