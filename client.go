@@ -72,7 +72,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	}
 
 	var authResp struct {
-		APIToken                        string `json:"apiToken"`
+		APIToken                       string `json:"apiToken"`
 		BasicAuthenticationCredentials string `json:"basicAuthenticationCredentials"`
 	}
 
@@ -99,12 +99,12 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 		if searchZone == "" {
 			continue
 		}
-		
+
 		fmt.Printf("DEBUG: Searching for zone with absoluteName: %s\n", searchZone)
-		
+
 		// Use filter to search for zone by absoluteName
 		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=absoluteName:eq('%s')", c.baseURL, searchZone)
-		
+
 		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 		if err != nil {
 			continue
@@ -230,7 +230,7 @@ func (c *Client) CreateResourceRecord(ctx context.Context, zoneID int64, zone st
 func (c *Client) DeleteResourceRecord(ctx context.Context, record libdns.Record) error {
 	// Extract the record ID from ProviderData
 	recordID := getRecordID(record)
-	
+
 	if recordID == 0 {
 		return fmt.Errorf("record ID not found in provider data")
 	}
@@ -253,6 +253,43 @@ func (c *Client) DeleteResourceRecord(ctx context.Context, record libdns.Record)
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
+}
+
+// DeployZone triggers a quick deployment of changes for a specific zone
+func (c *Client) DeployZone(ctx context.Context, zoneID int64) error {
+	url := fmt.Sprintf("%s/api/v2/zones/%d/deployments", c.baseURL, zoneID)
+
+	// Use QuickDeployment type for immediate deployment
+	payload := map[string]string{
+		"type": "QuickDeployment",
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal deployment payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create deployment request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Basic "+c.authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to deploy zone: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to deploy zone with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	return nil

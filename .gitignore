@@ -44,3 +44,4 @@ test_config.go
 
 # Test binaries
 example/
+bluecat-example

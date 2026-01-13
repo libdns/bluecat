@@ -74,6 +74,11 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		created = append(created, rec)
 	}
 
+	// Deploy the zone to make changes take effect immediately
+	if err := p.client.DeployZone(ctx, zoneID); err != nil {
+		return created, fmt.Errorf("failed to deploy zone: %w", err)
+	}
+
 	return created, nil
 }
 
@@ -147,6 +152,11 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 		updated = append(updated, created)
 	}
 
+	// Deploy the zone to make changes take effect immediately
+	if err := p.client.DeployZone(ctx, zoneID); err != nil {
+		return updated, fmt.Errorf("failed to deploy zone: %w", err)
+	}
+
 	return updated, nil
 }
 
@@ -180,6 +190,13 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 				}
 				deleted = append(deleted, existing)
 			}
+		}
+	}
+
+	// Deploy the zone to make changes take effect immediately
+	if len(deleted) > 0 {
+		if err := p.client.DeployZone(ctx, zoneID); err != nil {
+			return deleted, fmt.Errorf("failed to deploy zone: %w", err)
 		}
 	}
 
