@@ -139,8 +139,10 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 	return 0, fmt.Errorf("no zone found for %s", zone)
 }
 
-// GetResourceRecords retrieves all resource records for a zone
-func (c *Client) GetResourceRecords(ctx context.Context, zoneID int64) ([]libdns.Record, error) {
+// GetResourceRecords retrieves all resource records for a zone.
+// Note: This only fetches the first page of records (up to 1000).
+// For Caddy ACME use case, records are deleted using stored IDs, so full enumeration is not needed.
+func (c *Client) GetResourceRecords(ctx context.Context, zoneID int64, zone string) ([]libdns.Record, error) {
 	url := fmt.Sprintf("%s/api/v2/zones/%d/resourceRecords", c.baseURL, zoneID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -173,7 +175,7 @@ func (c *Client) GetResourceRecords(ctx context.Context, zoneID int64) ([]libdns
 	// Convert Bluecat records to libdns records
 	var records []libdns.Record
 	for _, bcRec := range recordsResp.Data {
-		rec, err := convertBluecatToLibdns(bcRec)
+		rec, err := convertBluecatToLibdns(bcRec, zone)
 		if err != nil {
 			// Skip records we can't convert
 			continue
@@ -223,7 +225,10 @@ func (c *Client) CreateResourceRecord(ctx context.Context, zoneID int64, zone st
 		return nil, fmt.Errorf("failed to decode created record: %w", err)
 	}
 
-	return convertBluecatToLibdns(createdRecord)
+	fmt.Printf("DEBUG: Created record response: Name=%s, AbsoluteName=%s, Type=%s, ID=%d\n",
+		createdRecord.Name, createdRecord.AbsoluteName, createdRecord.RecordType, createdRecord.ID)
+
+	return convertBluecatToLibdns(createdRecord, zone)
 }
 
 // DeleteResourceRecord deletes a resource record
@@ -419,9 +424,27 @@ type BluecatResourceRecord struct {
 }
 
 // convertBluecatToLibdns converts a Bluecat resource record to a libdns record
-func convertBluecatToLibdns(bcRec BluecatResourceRecord) (libdns.Record, error) {
-	// Calculate relative name
-	name := bcRec.Name
+func convertBluecatToLibdns(bcRec BluecatResourceRecord, zone string) (libdns.Record, error) {
+	// Clean up zone
+	zone = strings.TrimSuffix(zone, ".")
+
+	// Calculate relative name from absoluteName
+	var name string
+	if bcRec.AbsoluteName != "" {
+		// Use absoluteName to calculate the relative name
+		absName := strings.TrimSuffix(bcRec.AbsoluteName, ".")
+		if absName == zone {
+			name = "@"
+		} else if strings.HasSuffix(absName, "."+zone) {
+			name = strings.TrimSuffix(absName, "."+zone)
+		} else {
+			// Fallback to name field
+			name = bcRec.Name
+		}
+	} else {
+		name = bcRec.Name
+	}
+
 	if name == "" {
 		name = "@"
 	}
@@ -605,41 +628,4 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 	}
 
 	return bcRec, nil
-}
-
-// Helper method to extract provider data as int64
-func getRecordID(record libdns.Record) int64 {
-	switch rec := record.(type) {
-	case libdns.Address:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.CNAME:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.TXT:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.MX:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.NS:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.SRV:
-		if id, ok := rec.ProviderData.(int64); ok {
-			return id
-		}
-	case libdns.RR:
-		// RR types don't have ProviderData, try to extract from the record itself
-		// This shouldn't happen in normal operation
-		fmt.Printf("DEBUG: Trying to get ID from RR type (this shouldn't happen)\n")
-	}
-
-	fmt.Printf("DEBUG: Failed to extract record ID from type %T with ProviderData: %v\n", record, record.RR())
-	return 0
 }

@@ -45,7 +45,7 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 	}
 
 	// Get all resource records for the zone
-	records, err := p.client.GetResourceRecords(ctx, zoneID)
+	records, err := p.client.GetResourceRecords(ctx, zoneID, zone)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get resource records: %w", err)
 	}
@@ -96,7 +96,7 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 	}
 
 	// Get existing records to determine what needs to be updated/created/deleted
-	existingRecords, err := p.client.GetResourceRecords(ctx, zoneID)
+	existingRecords, err := p.client.GetResourceRecords(ctx, zoneID, zone)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get existing records: %w", err)
 	}
@@ -161,36 +161,32 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 }
 
 // DeleteRecords deletes the specified records from the zone. It returns the records that were deleted.
+// Records must have BlueCat IDs stored in ProviderData (from AppendRecords in the same session).
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	if err := p.ensureClient(ctx); err != nil {
 		return nil, err
 	}
 
-	// Get the zone ID
+	// Get the zone ID for deployment later
 	zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get zone ID: %w", err)
 	}
 
-	// Get all existing records to find the IDs we need to delete
-	existingRecords, err := p.client.GetResourceRecords(ctx, zoneID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get existing records: %w", err)
-	}
-
 	var deleted []libdns.Record
+
+	// Delete records using their BlueCat IDs from ProviderData
 	for _, record := range records {
-		rr := record.RR()
-		// Find matching record in existing records
-		for _, existing := range existingRecords {
-			existingRR := existing.RR()
-			if matchesRecord(rr, existingRR) {
-				if err := p.client.DeleteResourceRecord(ctx, existing); err != nil {
-					return deleted, fmt.Errorf("failed to delete record: %w", err)
-				}
-				deleted = append(deleted, existing)
-			}
+		recordID := getRecordID(record)
+		if recordID == 0 {
+			return deleted, fmt.Errorf("record does not have BlueCat ID in ProviderData - cannot delete")
 		}
+
+		fmt.Printf("DEBUG: Deleting record by ID: %d\n", recordID)
+		if err := p.client.DeleteResourceRecord(ctx, record); err != nil {
+			return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
+		}
+		deleted = append(deleted, record)
 	}
 
 	// Deploy the zone to make changes take effect immediately
@@ -201,6 +197,37 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	}
 
 	return deleted, nil
+}
+
+// getRecordID extracts the BlueCat record ID from ProviderData
+func getRecordID(record libdns.Record) int64 {
+	switch rec := record.(type) {
+	case libdns.Address:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	case libdns.CNAME:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	case libdns.TXT:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	case libdns.MX:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	case libdns.NS:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	case libdns.SRV:
+		if id, ok := rec.ProviderData.(int64); ok {
+			return id
+		}
+	}
+	return 0
 }
 
 // ensureClient ensures the client is initialized and authenticated
