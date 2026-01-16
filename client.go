@@ -34,7 +34,7 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 		username: username,
 		password: password,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 180 * time.Second,
 		},
 	}, nil
 }
