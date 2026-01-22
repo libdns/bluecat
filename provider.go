@@ -5,6 +5,7 @@ package bluecat
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/libdns/libdns"
@@ -161,42 +162,67 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 }
 
 // DeleteRecords deletes the specified records from the zone. It returns the records that were deleted.
-// Records must have BlueCat IDs stored in ProviderData (from AppendRecords in the same session).
+// If records have BlueCat IDs in ProviderData, those are used directly.
+// Otherwise, records are looked up by absoluteName to find their IDs.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if err := p.ensureClient(ctx); err != nil {
-		return nil, err
-	}
+if err := p.ensureClient(ctx); err != nil {
+return nil, err
+}
 
-	// Get the zone ID for deployment later
-	zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get zone ID: %w", err)
-	}
+// Clean up zone
+zone = strings.TrimSuffix(zone, ".")
 
-	var deleted []libdns.Record
+// Get the zone ID for deployment later
+zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
+if err != nil {
+return nil, fmt.Errorf("failed to get zone ID: %w", err)
+}
 
-	// Delete records using their BlueCat IDs from ProviderData
-	for _, record := range records {
-		recordID := getRecordID(record)
-		if recordID == 0 {
-			return deleted, fmt.Errorf("record does not have BlueCat ID in ProviderData - cannot delete")
-		}
+var deleted []libdns.Record
 
-		fmt.Printf("DEBUG: Deleting record by ID: %d\n", recordID)
-		if err := p.client.DeleteResourceRecord(ctx, record); err != nil {
-			return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
-		}
-		deleted = append(deleted, record)
-	}
+for _, record := range records {
+rr := record.RR()
+recordID := getRecordID(record)
 
-	// Deploy the zone to make changes take effect immediately
-	if len(deleted) > 0 {
-		if err := p.client.DeployZone(ctx, zoneID); err != nil {
-			return deleted, fmt.Errorf("failed to deploy zone: %w", err)
-		}
-	}
+// If we do not have a record ID, look it up by absoluteName
+if recordID == 0 {
+// Construct the absolute name
+var absoluteName string
+if rr.Name == "@" || rr.Name == "" {
+absoluteName = zone
+} else {
+absoluteName = rr.Name + "." + zone
+}
 
-	return deleted, nil
+
+bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
+if err != nil {
+return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
+}
+
+if bcRecord == nil {
+// Record not found - it may have been already deleted, continue
+deleted = append(deleted, record)
+continue
+}
+
+recordID = bcRecord.ID
+}
+
+if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
+return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
+}
+deleted = append(deleted, record)
+}
+
+// Deploy the zone to make changes take effect immediately
+if len(deleted) > 0 {
+if err := p.client.DeployZone(ctx, zoneID); err != nil {
+return deleted, fmt.Errorf("failed to deploy zone: %w", err)
+}
+}
+
+return deleted, nil
 }
 
 // getRecordID extracts the BlueCat record ID from ProviderData

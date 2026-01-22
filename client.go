@@ -100,7 +100,6 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 			continue
 		}
 
-		fmt.Printf("DEBUG: Searching for zone with absoluteName: %s\n", searchZone)
 
 		// Use filter to search for zone by absoluteName
 		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=absoluteName:eq('%s')", c.baseURL, searchZone)
@@ -129,7 +128,6 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 
 			if err := json.NewDecoder(resp.Body).Decode(&zonesResp); err == nil && len(zonesResp.Data) > 0 {
 				resp.Body.Close()
-				fmt.Printf("DEBUG: Found zone: %s (ID: %d)\n", zonesResp.Data[0].AbsoluteName, zonesResp.Data[0].ID)
 				return zonesResp.Data[0].ID, nil
 			}
 		}
@@ -225,8 +223,6 @@ func (c *Client) CreateResourceRecord(ctx context.Context, zoneID int64, zone st
 		return nil, fmt.Errorf("failed to decode created record: %w", err)
 	}
 
-	fmt.Printf("DEBUG: Created record response: Name=%s, AbsoluteName=%s, Type=%s, ID=%d\n",
-		createdRecord.Name, createdRecord.AbsoluteName, createdRecord.RecordType, createdRecord.ID)
 
 	return convertBluecatToLibdns(createdRecord, zone)
 }
@@ -628,4 +624,82 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 	}
 
 	return bcRec, nil
+}
+
+// GetResourceRecordByAbsoluteName searches for a resource record by its absolute name and type
+// using BlueCat's filter API. This is useful when we need to find a record without knowing
+// which zone it's directly under.
+func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType string) (*BluecatResourceRecord, error) {
+absoluteName = strings.TrimSuffix(absoluteName, ".")
+
+// Build the filter query - search by absoluteName
+// BlueCat API v2 supports filtering on resourceRecords endpoint
+apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
+if recordType != "" {
+apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
+}
+
+
+req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+if err != nil {
+return nil, fmt.Errorf("failed to create request: %w", err)
+}
+
+req.Header.Set("Authorization", "Basic "+c.authHeader)
+req.Header.Set("Accept", "application/json")
+
+resp, err := c.httpClient.Do(req)
+if err != nil {
+return nil, fmt.Errorf("failed to search resource records: %w", err)
+}
+defer resp.Body.Close()
+
+if resp.StatusCode != http.StatusOK {
+bodyBytes, _ := io.ReadAll(resp.Body)
+return nil, fmt.Errorf("failed to search resource records with status %d: %s", resp.StatusCode, string(bodyBytes))
+}
+
+var recordsResp struct {
+Data []BluecatResourceRecord `json:"data"`
+}
+
+if err := json.NewDecoder(resp.Body).Decode(&recordsResp); err != nil {
+return nil, fmt.Errorf("failed to decode resource records: %w", err)
+}
+
+if len(recordsResp.Data) == 0 {
+return nil, nil
+}
+
+return &recordsResp.Data[0], nil
+}
+
+// DeleteResourceRecordByID deletes a resource record by its ID directly
+func (c *Client) DeleteResourceRecordByID(ctx context.Context, recordID int64) error {
+if recordID == 0 {
+return fmt.Errorf("record ID cannot be zero")
+}
+
+url := fmt.Sprintf("%s/api/v2/resourceRecords/%d", c.baseURL, recordID)
+
+
+req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+if err != nil {
+return fmt.Errorf("failed to create delete request: %w", err)
+}
+
+req.Header.Set("Authorization", "Basic "+c.authHeader)
+
+resp, err := c.httpClient.Do(req)
+if err != nil {
+return fmt.Errorf("failed to delete resource record: %w", err)
+}
+defer resp.Body.Close()
+
+if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+bodyBytes, _ := io.ReadAll(resp.Body)
+return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
+}
+
+return nil
 }
