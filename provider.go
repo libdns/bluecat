@@ -193,10 +193,11 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		if recordID == 0 {
 			// Construct the absolute name
 			var absoluteName string
-			if rr.Name == "@" || rr.Name == "" {
+			relativeName := normalizeRecordName(rr.Name, zone)
+			if relativeName == "@" {
 				absoluteName = zone
 			} else {
-				absoluteName = rr.Name + "." + zone
+				absoluteName = relativeName + "." + zone
 			}
 
 			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
