@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/libdns/libdns"
 )
@@ -29,10 +28,6 @@ type Provider struct {
 
 	// View name in Bluecat (optional, defaults to first available)
 	ViewName string `json:"view_name,omitempty"`
-
-	// DeploymentBatchWindow is the debounce window used to coalesce quick deploys
-	// for the same zone. Zero uses the default.
-	DeploymentBatchWindow time.Duration `json:"deployment_batch_window,omitempty"`
 
 	client *Client
 	mu     sync.Mutex
@@ -170,63 +165,64 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 // If records have BlueCat IDs in ProviderData, those are used directly.
 // Otherwise, records are looked up by absoluteName to find their IDs.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if err := p.ensureClient(ctx); err != nil {
-		return nil, err
-	}
+if err := p.ensureClient(ctx); err != nil {
+return nil, err
+}
 
-	// Clean up zone
-	zone = strings.TrimSuffix(zone, ".")
+// Clean up zone
+zone = strings.TrimSuffix(zone, ".")
 
-	// Get the zone ID for deployment later
-	zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get zone ID: %w", err)
-	}
+// Get the zone ID for deployment later
+zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
+if err != nil {
+return nil, fmt.Errorf("failed to get zone ID: %w", err)
+}
 
-	var deleted []libdns.Record
+var deleted []libdns.Record
 
-	for _, record := range records {
-		rr := record.RR()
-		recordID := getRecordID(record)
+for _, record := range records {
+rr := record.RR()
+recordID := getRecordID(record)
 
-		// If we do not have a record ID, look it up by absoluteName
-		if recordID == 0 {
-			// Construct the absolute name
-			var absoluteName string
-			if rr.Name == "@" || rr.Name == "" {
-				absoluteName = zone
-			} else {
-				absoluteName = rr.Name + "." + zone
-			}
+// If we do not have a record ID, look it up by absoluteName
+if recordID == 0 {
+// Construct the absolute name
+var absoluteName string
+if rr.Name == "@" || rr.Name == "" {
+absoluteName = zone
+} else {
+absoluteName = rr.Name + "." + zone
+}
 
-			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
-			if err != nil {
-				return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
-			}
 
-			if bcRecord == nil {
-				// Record not found - it may have been already deleted, continue
-				deleted = append(deleted, record)
-				continue
-			}
+bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
+if err != nil {
+return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
+}
 
-			recordID = bcRecord.ID
-		}
+if bcRecord == nil {
+// Record not found - it may have been already deleted, continue
+deleted = append(deleted, record)
+continue
+}
 
-		if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
-			return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
-		}
-		deleted = append(deleted, record)
-	}
+recordID = bcRecord.ID
+}
 
-	// Deploy the zone to make changes take effect immediately
-	if len(deleted) > 0 {
-		if err := p.client.DeployZone(ctx, zoneID); err != nil {
-			return deleted, fmt.Errorf("failed to deploy zone: %w", err)
-		}
-	}
+if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
+return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
+}
+deleted = append(deleted, record)
+}
 
-	return deleted, nil
+// Deploy the zone to make changes take effect immediately
+if len(deleted) > 0 {
+if err := p.client.DeployZone(ctx, zoneID); err != nil {
+return deleted, fmt.Errorf("failed to deploy zone: %w", err)
+}
+}
+
+return deleted, nil
 }
 
 // getRecordID extracts the BlueCat record ID from ProviderData
@@ -279,7 +275,7 @@ func (p *Provider) ensureClient(ctx context.Context) error {
 		return fmt.Errorf("password is required")
 	}
 
-	client, err := NewClient(p.ServerURL, p.Username, p.Password, p.DeploymentBatchWindow)
+	client, err := NewClient(p.ServerURL, p.Username, p.Password)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
