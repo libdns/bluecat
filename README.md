@@ -12,6 +12,11 @@ To use this provider, you need:
 - Username
 - Password
 
+Optional settings:
+- Configuration name
+- View name
+- Deployment batch window for coalescing quick deploys in the same zone
+
 ## Example Usage
 
 ```go
@@ -34,6 +39,8 @@ func main() {
 		// Optional: specify configuration and view names
 		// ConfigurationName: "config",
 		// ViewName: "view",
+		// Optional: batch same-zone quick deploys for 5 seconds
+		// DeploymentBatchWindow: 5 * time.Second,
 	}
 
 	zone := "example.com."
@@ -67,6 +74,7 @@ func main() {
 - The provider requires Bluecat Address Manager 9.5.0 or later with the RESTful v2 API enabled
 - Record names should be relative to the zone (e.g., "www" for "www.example.com" in zone "example.com.")
 - Handling of Bluecat's linked records is not properly implemented yet. Networks and existing records to link A records and CNAMEs must already exist.
+- Quick deploys are coalesced per zone within a short window. The default is 2 seconds, and you can override it with `DeploymentBatchWindow`.
 
 ## Features
 - Authentication sessions are automatically managed and tokens are cached for efficiency

@@ -9,10 +9,99 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libdns/libdns"
 )
+
+const defaultDeployCoalesceWindow = 2 * time.Second
+
+var zoneDeploys = newZoneDeployCoordinator()
+
+type zoneDeployCoordinator struct {
+	mu    sync.Mutex
+	batch map[string]*zoneDeployBatch
+}
+
+type zoneDeployBatch struct {
+	pending []chan error
+	timer   *time.Timer
+	running bool
+}
+
+func newZoneDeployCoordinator() *zoneDeployCoordinator {
+	return &zoneDeployCoordinator{
+		batch: make(map[string]*zoneDeployBatch),
+	}
+}
+
+func (c *zoneDeployCoordinator) request(ctx context.Context, key string, window time.Duration, deploy func() error) error {
+	done := make(chan error, 1)
+
+	c.mu.Lock()
+	batch, ok := c.batch[key]
+	if !ok {
+		batch = &zoneDeployBatch{}
+		c.batch[key] = batch
+	}
+	batch.pending = append(batch.pending, done)
+	if batch.timer == nil {
+		batch.timer = time.AfterFunc(window, func() {
+			c.run(key, window, deploy)
+		})
+	} else {
+		batch.timer.Reset(window)
+	}
+	c.mu.Unlock()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *zoneDeployCoordinator) run(key string, window time.Duration, deploy func() error) {
+	c.mu.Lock()
+	batch, ok := c.batch[key]
+	if !ok || batch.running {
+		c.mu.Unlock()
+		return
+	}
+
+	pending := batch.pending
+	batch.pending = nil
+	batch.timer = nil
+	batch.running = true
+	c.mu.Unlock()
+
+	err := deploy()
+
+	for _, done := range pending {
+		done <- err
+	}
+
+	c.mu.Lock()
+	batch, ok = c.batch[key]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+
+	batch.running = false
+	if len(batch.pending) == 0 {
+		delete(c.batch, key)
+		c.mu.Unlock()
+		return
+	}
+
+	batch.timer = time.AfterFunc(window, func() {
+		c.run(key, window, deploy)
+	})
+	c.mu.Unlock()
+}
 
 // Client handles communication with the Bluecat API
 type Client struct {
@@ -22,12 +111,17 @@ type Client struct {
 	httpClient *http.Client
 	apiToken   string
 	authHeader string
+
+	deployCoalesceWindow time.Duration
 }
 
 // NewClient creates a new Bluecat API client
-func NewClient(baseURL, username, password string) (*Client, error) {
+func NewClient(baseURL, username, password string, deployCoalesceWindow time.Duration) (*Client, error) {
 	// Trim trailing slash from baseURL
 	baseURL = strings.TrimSuffix(baseURL, "/")
+	if deployCoalesceWindow <= 0 {
+		deployCoalesceWindow = defaultDeployCoalesceWindow
+	}
 
 	return &Client{
 		baseURL:  baseURL,
@@ -36,6 +130,7 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 		},
+		deployCoalesceWindow: deployCoalesceWindow,
 	}, nil
 }
 
@@ -99,7 +194,6 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 		if searchZone == "" {
 			continue
 		}
-
 
 		// Use filter to search for zone by absoluteName
 		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=absoluteName:eq('%s')", c.baseURL, searchZone)
@@ -223,7 +317,6 @@ func (c *Client) CreateResourceRecord(ctx context.Context, zoneID int64, zone st
 		return nil, fmt.Errorf("failed to decode created record: %w", err)
 	}
 
-
 	return convertBluecatToLibdns(createdRecord, zone)
 }
 
@@ -261,39 +354,43 @@ func (c *Client) DeleteResourceRecord(ctx context.Context, record libdns.Record)
 
 // DeployZone triggers a quick deployment of changes for a specific zone
 func (c *Client) DeployZone(ctx context.Context, zoneID int64) error {
-	url := fmt.Sprintf("%s/api/v2/zones/%d/deployments", c.baseURL, zoneID)
+	deployKey := fmt.Sprintf("%s|%d", c.baseURL, zoneID)
 
-	// Use QuickDeployment type for immediate deployment
-	payload := map[string]string{
-		"type": "QuickDeployment",
-	}
+	return zoneDeploys.request(ctx, deployKey, c.deployCoalesceWindow, func() error {
+		url := fmt.Sprintf("%s/api/v2/zones/%d/deployments", c.baseURL, zoneID)
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal deployment payload: %w", err)
-	}
+		// Use QuickDeployment type for immediate deployment
+		payload := map[string]string{
+			"type": "QuickDeployment",
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("failed to create deployment request: %w", err)
-	}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("failed to marshal deployment payload: %w", err)
+		}
 
-	req.Header.Set("Authorization", "Basic "+c.authHeader)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("failed to create deployment request: %w", err)
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to deploy zone: %w", err)
-	}
-	defer resp.Body.Close()
+		req.Header.Set("Authorization", "Basic "+c.authHeader)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
 
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to deploy zone with status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to deploy zone: %w", err)
+		}
+		defer resp.Body.Close()
 
-	return nil
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to deploy zone with status %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		return nil
+	})
 }
 
 // getConfigurationID retrieves the configuration ID by name, or the first one if name is empty
@@ -630,76 +727,74 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 // using BlueCat's filter API. This is useful when we need to find a record without knowing
 // which zone it's directly under.
 func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType string) (*BluecatResourceRecord, error) {
-absoluteName = strings.TrimSuffix(absoluteName, ".")
+	absoluteName = strings.TrimSuffix(absoluteName, ".")
 
-// Build the filter query - search by absoluteName
-// BlueCat API v2 supports filtering on resourceRecords endpoint
-apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
-if recordType != "" {
-apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
-}
+	// Build the filter query - search by absoluteName
+	// BlueCat API v2 supports filtering on resourceRecords endpoint
+	apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
+	if recordType != "" {
+		apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
+	}
 
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 
-req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-if err != nil {
-return nil, fmt.Errorf("failed to create request: %w", err)
-}
+	req.Header.Set("Authorization", "Basic "+c.authHeader)
+	req.Header.Set("Accept", "application/json")
 
-req.Header.Set("Authorization", "Basic "+c.authHeader)
-req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search resource records: %w", err)
+	}
+	defer resp.Body.Close()
 
-resp, err := c.httpClient.Do(req)
-if err != nil {
-return nil, fmt.Errorf("failed to search resource records: %w", err)
-}
-defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to search resource records with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
 
-if resp.StatusCode != http.StatusOK {
-bodyBytes, _ := io.ReadAll(resp.Body)
-return nil, fmt.Errorf("failed to search resource records with status %d: %s", resp.StatusCode, string(bodyBytes))
-}
+	var recordsResp struct {
+		Data []BluecatResourceRecord `json:"data"`
+	}
 
-var recordsResp struct {
-Data []BluecatResourceRecord `json:"data"`
-}
+	if err := json.NewDecoder(resp.Body).Decode(&recordsResp); err != nil {
+		return nil, fmt.Errorf("failed to decode resource records: %w", err)
+	}
 
-if err := json.NewDecoder(resp.Body).Decode(&recordsResp); err != nil {
-return nil, fmt.Errorf("failed to decode resource records: %w", err)
-}
+	if len(recordsResp.Data) == 0 {
+		return nil, nil
+	}
 
-if len(recordsResp.Data) == 0 {
-return nil, nil
-}
-
-return &recordsResp.Data[0], nil
+	return &recordsResp.Data[0], nil
 }
 
 // DeleteResourceRecordByID deletes a resource record by its ID directly
 func (c *Client) DeleteResourceRecordByID(ctx context.Context, recordID int64) error {
-if recordID == 0 {
-return fmt.Errorf("record ID cannot be zero")
-}
+	if recordID == 0 {
+		return fmt.Errorf("record ID cannot be zero")
+	}
 
-url := fmt.Sprintf("%s/api/v2/resourceRecords/%d", c.baseURL, recordID)
+	url := fmt.Sprintf("%s/api/v2/resourceRecords/%d", c.baseURL, recordID)
 
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
 
-req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
-if err != nil {
-return fmt.Errorf("failed to create delete request: %w", err)
-}
+	req.Header.Set("Authorization", "Basic "+c.authHeader)
 
-req.Header.Set("Authorization", "Basic "+c.authHeader)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete resource record: %w", err)
+	}
+	defer resp.Body.Close()
 
-resp, err := c.httpClient.Do(req)
-if err != nil {
-return fmt.Errorf("failed to delete resource record: %w", err)
-}
-defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
 
-if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-bodyBytes, _ := io.ReadAll(resp.Body)
-return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
-}
-
-return nil
+	return nil
 }
