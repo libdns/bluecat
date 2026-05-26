@@ -7,9 +7,16 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/libdns/libdns"
 )
+
+// deployState tracks a pending debounced deployment for a single zone.
+type deployState struct {
+	timer  *time.Timer
+	zoneID int64
+}
 
 // Provider facilitates DNS record manipulation with Bluecat Address Manager.
 type Provider struct {
@@ -29,8 +36,19 @@ type Provider struct {
 	// View name in Bluecat (optional, defaults to first available)
 	ViewName string `json:"view_name,omitempty"`
 
-	client *Client
-	mu     sync.Mutex
+	// DeployDelay is how long to wait after the last record write before
+	// issuing a QuickDeploy to Bluecat. This debounces rapid sequential
+	// writes (e.g. multiple concurrent ACME DNS-01 challenges) into a
+	// single deploy call, avoiding Bluecat timeouts.
+	//
+	// Defaults to 10 seconds when zero or unset.
+	// Set to -1 to disable automatic deployment entirely (advanced use only).
+	DeployDelay time.Duration `json:"deploy_delay,omitempty"`
+
+	client         *Client
+	mu             sync.Mutex
+	deployMu       sync.Mutex
+	pendingDeploys map[int64]*deployState
 }
 
 // GetRecords lists all the records in the zone.
@@ -75,10 +93,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		created = append(created, rec)
 	}
 
-	// Deploy the zone to make changes take effect immediately
-	if err := p.client.DeployZone(ctx, zoneID); err != nil {
-		return created, fmt.Errorf("failed to deploy zone: %w", err)
-	}
+	p.scheduleDeployZone(zoneID)
 
 	return created, nil
 }
@@ -153,10 +168,7 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 		updated = append(updated, created)
 	}
 
-	// Deploy the zone to make changes take effect immediately
-	if err := p.client.DeployZone(ctx, zoneID); err != nil {
-		return updated, fmt.Errorf("failed to deploy zone: %w", err)
-	}
+	p.scheduleDeployZone(zoneID)
 
 	return updated, nil
 }
@@ -165,64 +177,60 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 // If records have BlueCat IDs in ProviderData, those are used directly.
 // Otherwise, records are looked up by absoluteName to find their IDs.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-if err := p.ensureClient(ctx); err != nil {
-return nil, err
-}
+	if err := p.ensureClient(ctx); err != nil {
+		return nil, err
+	}
 
-// Clean up zone
-zone = strings.TrimSuffix(zone, ".")
+	// Clean up zone
+	zone = strings.TrimSuffix(zone, ".")
 
-// Get the zone ID for deployment later
-zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
-if err != nil {
-return nil, fmt.Errorf("failed to get zone ID: %w", err)
-}
+	// Get the zone ID for deployment later
+	zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get zone ID: %w", err)
+	}
 
-var deleted []libdns.Record
+	var deleted []libdns.Record
 
-for _, record := range records {
-rr := record.RR()
-recordID := getRecordID(record)
+	for _, record := range records {
+		rr := record.RR()
+		recordID := getRecordID(record)
 
-// If we do not have a record ID, look it up by absoluteName
-if recordID == 0 {
-// Construct the absolute name
-var absoluteName string
-if rr.Name == "@" || rr.Name == "" {
-absoluteName = zone
-} else {
-absoluteName = rr.Name + "." + zone
-}
+		// If we do not have a record ID, look it up by absoluteName
+		if recordID == 0 {
+			// Construct the absolute name
+			var absoluteName string
+			if rr.Name == "@" || rr.Name == "" {
+				absoluteName = zone
+			} else {
+				absoluteName = rr.Name + "." + zone
+			}
 
+			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
+			if err != nil {
+				return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
+			}
 
-bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
-if err != nil {
-return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
-}
+			if bcRecord == nil {
+				// Record not found - it may have been already deleted, continue
+				deleted = append(deleted, record)
+				continue
+			}
 
-if bcRecord == nil {
-// Record not found - it may have been already deleted, continue
-deleted = append(deleted, record)
-continue
-}
+			recordID = bcRecord.ID
+		}
 
-recordID = bcRecord.ID
-}
+		if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
+			return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
+		}
+		deleted = append(deleted, record)
+	}
 
-if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
-return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
-}
-deleted = append(deleted, record)
-}
+	if len(deleted) > 0 {
+		p.scheduleDeployZone(zoneID)
+	}
 
-// Deploy the zone to make changes take effect immediately
-if len(deleted) > 0 {
-if err := p.client.DeployZone(ctx, zoneID); err != nil {
-return deleted, fmt.Errorf("failed to deploy zone: %w", err)
-}
-}
-
-return deleted, nil
+	return deleted, nil
 }
 
 // getRecordID extracts the BlueCat record ID from ProviderData
@@ -254,6 +262,53 @@ func getRecordID(record libdns.Record) int64 {
 		}
 	}
 	return 0
+}
+
+// scheduleDeployZone debounces QuickDeploy calls for a given zone.
+// It resets the deploy timer on every call; the actual deploy fires
+// only after no new calls arrive within DeployDelay.
+func (p *Provider) scheduleDeployZone(zoneID int64) {
+	if p.DeployDelay == -1 {
+		return
+	}
+
+	delay := p.DeployDelay
+	if delay <= 0 {
+		delay = 10 * time.Second
+	}
+
+	p.deployMu.Lock()
+	defer p.deployMu.Unlock()
+
+	if p.pendingDeploys == nil {
+		p.pendingDeploys = make(map[int64]*deployState)
+	}
+
+	if state, ok := p.pendingDeploys[zoneID]; ok {
+		// Another write arrived — reset the timer to wait longer.
+		state.timer.Reset(delay)
+		return
+	}
+
+	// First write for this zone in this window — arm the timer.
+	state := &deployState{zoneID: zoneID}
+	state.timer = time.AfterFunc(delay, func() {
+		p.deployMu.Lock()
+		delete(p.pendingDeploys, zoneID)
+		p.deployMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+
+		if err := p.client.DeployZone(ctx, zoneID); err != nil {
+			// Deploy errors are logged here; they do not surface to the
+			// caller because the deploy is async. Caddy will retry the
+			// full ACME flow on the next renewal cycle if DNS propagation
+			// fails as a result.
+			fmt.Printf("bluecat: deferred deploy for zone %d failed: %v\n", zoneID, err)
+		}
+	})
+	p.pendingDeploys[zoneID] = state
 }
 
 // ensureClient ensures the client is initialized and authenticated

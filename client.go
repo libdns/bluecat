@@ -22,6 +22,11 @@ type Client struct {
 	httpClient *http.Client
 	apiToken   string
 	authHeader string
+
+	// deployPollInterval is how often to poll for deployment completion (default 3s).
+	deployPollInterval time.Duration
+	// deployPollTimeout is how long to wait for a deployment to complete (default 120s).
+	deployPollTimeout time.Duration
 }
 
 // NewClient creates a new Bluecat API client
@@ -36,6 +41,8 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 		httpClient: &http.Client{
 			Timeout: 180 * time.Second,
 		},
+		deployPollInterval: 3 * time.Second,
+		deployPollTimeout:  120 * time.Second,
 	}, nil
 }
 
@@ -99,7 +106,6 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 		if searchZone == "" {
 			continue
 		}
-
 
 		// Use filter to search for zone by absoluteName
 		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=absoluteName:eq('%s')", c.baseURL, searchZone)
@@ -223,7 +229,6 @@ func (c *Client) CreateResourceRecord(ctx context.Context, zoneID int64, zone st
 		return nil, fmt.Errorf("failed to decode created record: %w", err)
 	}
 
-
 	return convertBluecatToLibdns(createdRecord, zone)
 }
 
@@ -259,7 +264,14 @@ func (c *Client) DeleteResourceRecord(ctx context.Context, record libdns.Record)
 	return nil
 }
 
-// DeployZone triggers a quick deployment of changes for a specific zone
+// bluecatDeployment is the subset of the Bluecat deployment resource we need.
+type bluecatDeployment struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
+}
+
+// DeployZone triggers a quick deployment of changes for a specific zone and
+// waits until Bluecat confirms the deployment is complete.
 func (c *Client) DeployZone(ctx context.Context, zoneID int64) error {
 	url := fmt.Sprintf("%s/api/v2/zones/%d/deployments", c.baseURL, zoneID)
 
@@ -293,7 +305,80 @@ func (c *Client) DeployZone(ctx context.Context, zoneID int64) error {
 		return fmt.Errorf("failed to deploy zone with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	return nil
+	// 201/200: deployment is already complete.
+	if resp.StatusCode != http.StatusAccepted {
+		return nil
+	}
+
+	// 202: deployment is queued/running. Parse the deployment ID and poll
+	// until Bluecat reports it as complete so the caller (certmagic) doesn't
+	// start its DNS propagation check before the record is actually live.
+	var dep bluecatDeployment
+	if err := json.NewDecoder(resp.Body).Decode(&dep); err != nil || dep.ID == 0 {
+		// Response body didn't contain a parseable deployment ID.
+		// Fall back to a best-effort fixed wait so we don't block forever.
+		return c.waitForDeploymentFallback(ctx)
+	}
+
+	return c.waitForDeployment(ctx, dep.ID)
+}
+
+// waitForDeployment polls GET /api/v2/deployments/{id} until status is terminal.
+func (c *Client) waitForDeployment(ctx context.Context, deployID int64) error {
+	pollURL := fmt.Sprintf("%s/api/v2/deployments/%d", c.baseURL, deployID)
+
+	deadline := time.Now().Add(c.deployPollTimeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for deployment %d to complete", deployID)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(c.deployPollInterval):
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", pollURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create deployment poll request: %w", err)
+		}
+		req.Header.Set("Authorization", "Basic "+c.authHeader)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			// Transient network error — keep polling.
+			continue
+		}
+
+		var dep bluecatDeployment
+		decodeErr := json.NewDecoder(resp.Body).Decode(&dep)
+		resp.Body.Close()
+
+		if decodeErr != nil {
+			continue
+		}
+
+		switch dep.Status {
+		case "COMPLETE", "DONE", "SUCCESS":
+			return nil
+		case "FAILED", "ERROR", "CANCELLED":
+			return fmt.Errorf("deployment %d finished with status %s", deployID, dep.Status)
+			// QUEUED, RUNNING, and any unknown status: keep polling.
+		}
+	}
+}
+
+// waitForDeploymentFallback is used when the 202 response body didn't contain a
+// deployment ID. It waits one poll interval as a best-effort settle time.
+func (c *Client) waitForDeploymentFallback(ctx context.Context) error {
+	select {
+	case <-time.After(c.deployPollInterval):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // getConfigurationID retrieves the configuration ID by name, or the first one if name is empty
@@ -417,6 +502,24 @@ type BluecatResourceRecord struct {
 	Addresses        []struct {
 		Address string `json:"address"`
 	} `json:"addresses,omitempty"`
+}
+
+// normalizeRecordName returns a zone-relative libdns name.
+// It accepts either a relative name (e.g. "_acme-challenge") or
+// an absolute name (e.g. "_acme-challenge.example.com.").
+func normalizeRecordName(name, zone string) string {
+	zone = strings.TrimSuffix(zone, ".")
+	name = strings.TrimSuffix(name, ".")
+
+	if name == "" || name == "@" || name == zone {
+		return "@"
+	}
+
+	if strings.HasSuffix(name, "."+zone) {
+		return strings.TrimSuffix(name, "."+zone)
+	}
+
+	return name
 }
 
 // convertBluecatToLibdns converts a Bluecat resource record to a libdns record
@@ -543,17 +646,18 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 
 	// Remove trailing dot from zone for proper absolute name construction
 	zone = strings.TrimSuffix(zone, ".")
+	relativeName := normalizeRecordName(rr.Name, zone)
 
 	// Construct absolute name
 	var absoluteName string
-	if rr.Name == "@" || rr.Name == "" {
+	if relativeName == "@" {
 		absoluteName = zone
 	} else {
-		absoluteName = rr.Name + "." + zone
+		absoluteName = relativeName + "." + zone
 	}
 
 	bcRec := BluecatResourceRecord{
-		Name:         rr.Name,
+		Name:         relativeName,
 		AbsoluteName: absoluteName,
 		TTL:          int(rr.TTL.Seconds()),
 	}
@@ -601,11 +705,12 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 		bcRec.Type = "SRVRecord"
 		bcRec.RecordType = "SRV"
 		// Construct the full SRV name: _service._protocol.name
-		bcRec.Name = fmt.Sprintf("_%s._%s.%s", rec.Service, rec.Transport, rec.Name)
-		if rec.Name == "@" || rec.Name == "" {
+		recordName := normalizeRecordName(rec.Name, zone)
+		bcRec.Name = fmt.Sprintf("_%s._%s.%s", rec.Service, rec.Transport, recordName)
+		if recordName == "@" {
 			bcRec.AbsoluteName = fmt.Sprintf("_%s._%s.%s", rec.Service, rec.Transport, zone)
 		} else {
-			bcRec.AbsoluteName = fmt.Sprintf("_%s._%s.%s.%s", rec.Service, rec.Transport, rec.Name, zone)
+			bcRec.AbsoluteName = fmt.Sprintf("_%s._%s.%s.%s", rec.Service, rec.Transport, recordName, zone)
 		}
 		bcRec.Priority = int(rec.Priority)
 		bcRec.Weight = int(rec.Weight)
@@ -630,76 +735,74 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 // using BlueCat's filter API. This is useful when we need to find a record without knowing
 // which zone it's directly under.
 func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType string) (*BluecatResourceRecord, error) {
-absoluteName = strings.TrimSuffix(absoluteName, ".")
+	absoluteName = strings.TrimSuffix(absoluteName, ".")
 
-// Build the filter query - search by absoluteName
-// BlueCat API v2 supports filtering on resourceRecords endpoint
-apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
-if recordType != "" {
-apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
-}
+	// Build the filter query - search by absoluteName
+	// BlueCat API v2 supports filtering on resourceRecords endpoint
+	apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
+	if recordType != "" {
+		apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
+	}
 
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 
-req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-if err != nil {
-return nil, fmt.Errorf("failed to create request: %w", err)
-}
+	req.Header.Set("Authorization", "Basic "+c.authHeader)
+	req.Header.Set("Accept", "application/json")
 
-req.Header.Set("Authorization", "Basic "+c.authHeader)
-req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search resource records: %w", err)
+	}
+	defer resp.Body.Close()
 
-resp, err := c.httpClient.Do(req)
-if err != nil {
-return nil, fmt.Errorf("failed to search resource records: %w", err)
-}
-defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to search resource records with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
 
-if resp.StatusCode != http.StatusOK {
-bodyBytes, _ := io.ReadAll(resp.Body)
-return nil, fmt.Errorf("failed to search resource records with status %d: %s", resp.StatusCode, string(bodyBytes))
-}
+	var recordsResp struct {
+		Data []BluecatResourceRecord `json:"data"`
+	}
 
-var recordsResp struct {
-Data []BluecatResourceRecord `json:"data"`
-}
+	if err := json.NewDecoder(resp.Body).Decode(&recordsResp); err != nil {
+		return nil, fmt.Errorf("failed to decode resource records: %w", err)
+	}
 
-if err := json.NewDecoder(resp.Body).Decode(&recordsResp); err != nil {
-return nil, fmt.Errorf("failed to decode resource records: %w", err)
-}
+	if len(recordsResp.Data) == 0 {
+		return nil, nil
+	}
 
-if len(recordsResp.Data) == 0 {
-return nil, nil
-}
-
-return &recordsResp.Data[0], nil
+	return &recordsResp.Data[0], nil
 }
 
 // DeleteResourceRecordByID deletes a resource record by its ID directly
 func (c *Client) DeleteResourceRecordByID(ctx context.Context, recordID int64) error {
-if recordID == 0 {
-return fmt.Errorf("record ID cannot be zero")
-}
+	if recordID == 0 {
+		return fmt.Errorf("record ID cannot be zero")
+	}
 
-url := fmt.Sprintf("%s/api/v2/resourceRecords/%d", c.baseURL, recordID)
+	url := fmt.Sprintf("%s/api/v2/resourceRecords/%d", c.baseURL, recordID)
 
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
 
-req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
-if err != nil {
-return fmt.Errorf("failed to create delete request: %w", err)
-}
+	req.Header.Set("Authorization", "Basic "+c.authHeader)
 
-req.Header.Set("Authorization", "Basic "+c.authHeader)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete resource record: %w", err)
+	}
+	defer resp.Body.Close()
 
-resp, err := c.httpClient.Do(req)
-if err != nil {
-return fmt.Errorf("failed to delete resource record: %w", err)
-}
-defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
 
-if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-bodyBytes, _ := io.ReadAll(resp.Body)
-return fmt.Errorf("failed to delete resource record with status %d: %s", resp.StatusCode, string(bodyBytes))
-}
-
-return nil
+	return nil
 }
