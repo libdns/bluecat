@@ -177,61 +177,60 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 // If records have BlueCat IDs in ProviderData, those are used directly.
 // Otherwise, records are looked up by absoluteName to find their IDs.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-if err := p.ensureClient(ctx); err != nil {
-return nil, err
-}
+	if err := p.ensureClient(ctx); err != nil {
+		return nil, err
+	}
 
-// Clean up zone
-zone = strings.TrimSuffix(zone, ".")
+	// Clean up zone
+	zone = strings.TrimSuffix(zone, ".")
 
-// Get the zone ID for deployment later
-zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
-if err != nil {
-return nil, fmt.Errorf("failed to get zone ID: %w", err)
-}
+	// Get the zone ID for deployment later
+	zoneID, err := p.client.GetZoneID(ctx, zone, p.ConfigurationName, p.ViewName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get zone ID: %w", err)
+	}
 
-var deleted []libdns.Record
+	var deleted []libdns.Record
 
-for _, record := range records {
-rr := record.RR()
-recordID := getRecordID(record)
+	for _, record := range records {
+		rr := record.RR()
+		recordID := getRecordID(record)
 
-// If we do not have a record ID, look it up by absoluteName
-if recordID == 0 {
-// Construct the absolute name
-var absoluteName string
-if rr.Name == "@" || rr.Name == "" {
-absoluteName = zone
-} else {
-absoluteName = rr.Name + "." + zone
-}
+		// If we do not have a record ID, look it up by absoluteName
+		if recordID == 0 {
+			// Construct the absolute name
+			var absoluteName string
+			if rr.Name == "@" || rr.Name == "" {
+				absoluteName = zone
+			} else {
+				absoluteName = rr.Name + "." + zone
+			}
 
+			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
+			if err != nil {
+				return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
+			}
 
-bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type)
-if err != nil {
-return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
-}
+			if bcRecord == nil {
+				// Record not found - it may have been already deleted, continue
+				deleted = append(deleted, record)
+				continue
+			}
 
-if bcRecord == nil {
-// Record not found - it may have been already deleted, continue
-deleted = append(deleted, record)
-continue
-}
+			recordID = bcRecord.ID
+		}
 
-recordID = bcRecord.ID
-}
+		if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
+			return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
+		}
+		deleted = append(deleted, record)
+	}
 
-if err := p.client.DeleteResourceRecordByID(ctx, recordID); err != nil {
-return deleted, fmt.Errorf("failed to delete record by ID %d: %w", recordID, err)
-}
-deleted = append(deleted, record)
-}
+	if len(deleted) > 0 {
+		p.scheduleDeployZone(zoneID)
+	}
 
-if len(deleted) > 0 {
-	p.scheduleDeployZone(zoneID)
-}
-
-return deleted, nil
+	return deleted, nil
 }
 
 // getRecordID extracts the BlueCat record ID from ProviderData
