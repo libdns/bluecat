@@ -176,11 +176,13 @@ func TestGetZoneIDScopesToView(t *testing.T) {
 }
 
 // TestGetResourceRecordByAbsoluteNameScopesToView verifies the resource record
-// lookup used by DeleteRecords also scopes its filter to the configured view.
+// lookup used by DeleteRecords is scoped to the zone's own resourceRecords
+// endpoint (which doesn't support filtering by view.name).
 func TestGetResourceRecordByAbsoluteNameScopesToView(t *testing.T) {
-	var gotRawQuery string
+	var gotPath, gotRawQuery string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		gotRawQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":7,"type":"TXTRecord","recordType":"TXT","name":"_acme-challenge","absoluteName":"_acme-challenge.acclaim.utas.edu.au"}]}`))
@@ -193,7 +195,7 @@ func TestGetResourceRecordByAbsoluteNameScopesToView(t *testing.T) {
 	}
 	client.authHeader = "token"
 
-	rec, err := client.GetResourceRecordByAbsoluteName(context.Background(), "_acme-challenge.acclaim.utas.edu.au", "TXT", "external")
+	rec, err := client.GetResourceRecordByAbsoluteName(context.Background(), 42, "_acme-challenge.acclaim.utas.edu.au", "TXT", "acclaim.utas.edu.au")
 	if err != nil {
 		t.Fatalf("GetResourceRecordByAbsoluteName failed: %v", err)
 	}
@@ -201,15 +203,19 @@ func TestGetResourceRecordByAbsoluteNameScopesToView(t *testing.T) {
 		t.Fatalf("expected record with ID 7, got %+v", rec)
 	}
 
+	if gotPath != "/api/v2/zones/42/resourceRecords" {
+		t.Errorf("expected request to zone-scoped resourceRecords endpoint, got %q", gotPath)
+	}
+
 	filter, err := url.QueryUnescape(gotRawQuery)
 	if err != nil {
 		t.Fatalf("failed to unescape query %q: %v", gotRawQuery, err)
 	}
-	if !strings.Contains(filter, "view.name:'external'") {
-		t.Errorf("expected filter to contain view.name:'external', got %q", filter)
+	if !strings.Contains(filter, "name:eq('_acme-challenge')") {
+		t.Errorf("expected filter to contain relative name clause, got %q", filter)
 	}
-	if !strings.Contains(filter, "absoluteName:eq('_acme-challenge.acclaim.utas.edu.au')") {
-		t.Errorf("expected filter to contain absoluteName clause, got %q", filter)
+	if strings.Contains(filter, "view.name") {
+		t.Errorf("filter should not reference view.name (unsupported on resourceRecords), got %q", filter)
 	}
 }
 

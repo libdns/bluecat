@@ -738,22 +738,19 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 }
 
 // GetResourceRecordByAbsoluteName searches for a resource record by its absolute name and type
-// using BlueCat's filter API. This is useful when we need to find a record without knowing
-// which zone it's directly under.
-func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType, viewName string) (*BluecatResourceRecord, error) {
-	absoluteName = strings.TrimSuffix(absoluteName, ".")
+// within a specific zone, converting to a zone-relative name since resourceRecords only supports
+// filtering by name (not absoluteName or view.name, which the API rejects with InvalidFilterField).
+// Scoping to zoneID ensures we only match the record in the correct view/zone.
+func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, zoneID int64, absoluteName, recordType, zone string) (*BluecatResourceRecord, error) {
+	relativeName := normalizeRecordName(absoluteName, zone)
 
-	// Build the filter query - search by absoluteName, scoped to the configured
-	// view so a same-named record in a lower-ID view doesn't win instead.
-	// BlueCat API v2 supports filtering on resourceRecords endpoint
-	filter := fmt.Sprintf("absoluteName:eq('%s')", absoluteName)
+	// resourceRecords only supports filtering by name (relative to its parent zone), not
+	// absoluteName or view.name, so we scope the search to the zone's own records.
+	filter := fmt.Sprintf("name:eq('%s')", relativeName)
 	if recordType != "" {
 		filter += fmt.Sprintf(" and recordType:eq('%s')", recordType)
 	}
-	if viewName != "" {
-		filter = fmt.Sprintf("view.name:'%s' and %s", viewName, filter)
-	}
-	apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=%s", c.baseURL, url.QueryEscape(filter))
+	apiURL := fmt.Sprintf("%s/api/v2/zones/%d/resourceRecords?filter=%s", c.baseURL, zoneID, url.QueryEscape(filter))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
