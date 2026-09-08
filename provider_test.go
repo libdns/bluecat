@@ -2,8 +2,12 @@ package bluecat
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +134,83 @@ func TestProvider(t *testing.T) {
 
 		t.Logf("Deleted %d records", len(deleted))
 	})
+}
+
+// TestGetZoneIDScopesToView verifies that when a ViewName is configured, the
+// zone lookup filter includes a view.name clause so a same-named zone in a
+// different (e.g. lower-ID private) view isn't matched instead.
+func TestGetZoneIDScopesToView(t *testing.T) {
+	var gotRawQuery string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":42,"name":"acclaim.utas.edu.au","absoluteName":"acclaim.utas.edu.au"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "user", "pass")
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.authHeader = "token"
+
+	zoneID, err := client.GetZoneID(context.Background(), "acclaim.utas.edu.au", "", "external")
+	if err != nil {
+		t.Fatalf("GetZoneID failed: %v", err)
+	}
+	if zoneID != 42 {
+		t.Errorf("expected zone ID 42, got %d", zoneID)
+	}
+
+	filter, err := url.QueryUnescape(gotRawQuery)
+	if err != nil {
+		t.Fatalf("failed to unescape query %q: %v", gotRawQuery, err)
+	}
+	if !strings.Contains(filter, "view.name:'external'") {
+		t.Errorf("expected filter to contain view.name:'external', got %q", filter)
+	}
+	if !strings.Contains(filter, "absoluteName:eq('acclaim.utas.edu.au')") {
+		t.Errorf("expected filter to contain absoluteName clause, got %q", filter)
+	}
+}
+
+// TestGetResourceRecordByAbsoluteNameScopesToView verifies the resource record
+// lookup used by DeleteRecords also scopes its filter to the configured view.
+func TestGetResourceRecordByAbsoluteNameScopesToView(t *testing.T) {
+	var gotRawQuery string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":7,"type":"TXTRecord","recordType":"TXT","name":"_acme-challenge","absoluteName":"_acme-challenge.acclaim.utas.edu.au"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "user", "pass")
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.authHeader = "token"
+
+	rec, err := client.GetResourceRecordByAbsoluteName(context.Background(), "_acme-challenge.acclaim.utas.edu.au", "TXT", "external")
+	if err != nil {
+		t.Fatalf("GetResourceRecordByAbsoluteName failed: %v", err)
+	}
+	if rec == nil || rec.ID != 7 {
+		t.Fatalf("expected record with ID 7, got %+v", rec)
+	}
+
+	filter, err := url.QueryUnescape(gotRawQuery)
+	if err != nil {
+		t.Fatalf("failed to unescape query %q: %v", gotRawQuery, err)
+	}
+	if !strings.Contains(filter, "view.name:'external'") {
+		t.Errorf("expected filter to contain view.name:'external', got %q", filter)
+	}
+	if !strings.Contains(filter, "absoluteName:eq('_acme-challenge.acclaim.utas.edu.au')") {
+		t.Errorf("expected filter to contain absoluteName clause, got %q", filter)
+	}
 }
 
 func TestMatchesRecord(t *testing.T) {
