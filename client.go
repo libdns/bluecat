@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 
@@ -107,8 +108,13 @@ func (c *Client) GetZoneID(ctx context.Context, zone, configName, viewName strin
 			continue
 		}
 
-		// Use filter to search for zone by absoluteName
-		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=absoluteName:eq('%s')", c.baseURL, searchZone)
+		// Use filter to search for zone by absoluteName, scoped to the configured
+		// view so a same-named zone in a lower-ID view doesn't win instead.
+		filter := fmt.Sprintf("absoluteName:eq('%s')", searchZone)
+		if viewName != "" {
+			filter = fmt.Sprintf("view.name:'%s' and %s", viewName, filter)
+		}
+		apiURL := fmt.Sprintf("%s/api/v2/zones?filter=%s", c.baseURL, url.QueryEscape(filter))
 
 		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 		if err != nil {
@@ -734,15 +740,20 @@ func convertLibdnsToBluecat(record libdns.Record, zone string) (BluecatResourceR
 // GetResourceRecordByAbsoluteName searches for a resource record by its absolute name and type
 // using BlueCat's filter API. This is useful when we need to find a record without knowing
 // which zone it's directly under.
-func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType string) (*BluecatResourceRecord, error) {
+func (c *Client) GetResourceRecordByAbsoluteName(ctx context.Context, absoluteName, recordType, viewName string) (*BluecatResourceRecord, error) {
 	absoluteName = strings.TrimSuffix(absoluteName, ".")
 
-	// Build the filter query - search by absoluteName
+	// Build the filter query - search by absoluteName, scoped to the configured
+	// view so a same-named record in a lower-ID view doesn't win instead.
 	// BlueCat API v2 supports filtering on resourceRecords endpoint
-	apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=absoluteName:eq('%s')", c.baseURL, absoluteName)
+	filter := fmt.Sprintf("absoluteName:eq('%s')", absoluteName)
 	if recordType != "" {
-		apiURL += fmt.Sprintf(" and recordType:eq('%s')", recordType)
+		filter += fmt.Sprintf(" and recordType:eq('%s')", recordType)
 	}
+	if viewName != "" {
+		filter = fmt.Sprintf("view.name:'%s' and %s", viewName, filter)
+	}
+	apiURL := fmt.Sprintf("%s/api/v2/resourceRecords?filter=%s", c.baseURL, url.QueryEscape(filter))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
