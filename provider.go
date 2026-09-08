@@ -196,7 +196,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		rr := record.RR()
 		recordID := getRecordID(record)
 
-		// If we do not have a record ID, look it up by absoluteName
+		// If we do not have a record ID, look it up within the zone by name
 		if recordID == 0 {
 			// Construct the absolute name
 			var absoluteName string
@@ -206,7 +206,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 				absoluteName = rr.Name + "." + zone
 			}
 
-			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, absoluteName, rr.Type, p.ViewName)
+			bcRecord, err := p.client.GetResourceRecordByAbsoluteName(ctx, zoneID, absoluteName, rr.Type, zone)
 			if err != nil {
 				return deleted, fmt.Errorf("failed to lookup record %s: %w", absoluteName, err)
 			}
