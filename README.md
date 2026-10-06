@@ -31,8 +31,7 @@ func main() {
 		ServerURL: "https://bluecat.example.com",
 		Username:  "api_user",
 		Password:  "api_password",
-		// Optional: specify configuration and view names
-		// ConfigurationName: "config",
+		// Optional: limit zone lookups to one DNS view
 		// ViewName: "view",
 	}
 
@@ -67,6 +66,7 @@ func main() {
 - The provider requires Bluecat Address Manager 9.5.0 or later with the RESTful v2 API enabled
 - Record names should be relative to the zone (e.g., "www" for "www.example.com" in zone "example.com.")
 - Handling of Bluecat's linked records is not properly implemented yet. Networks and existing records to link A records and CNAMEs must already exist.
+- `ConfigurationName` is accepted but not yet applied to zone lookups. If the same zone name exists in more than one configuration (or in more than one view with no `ViewName` set), lookups fail with an ambiguity error instead of picking one.
 
 ## Features
 - Authentication sessions are automatically managed and tokens are cached for efficiency
