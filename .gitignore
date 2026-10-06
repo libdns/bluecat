@@ -46,3 +46,9 @@ test_config.go
 example/
 bluecat-example
 Makefile
+
+# Test scripts
+scripts/probe-bluecat.sh
+
+# Test logs
+scripts/*.log
