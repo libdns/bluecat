@@ -31,10 +31,14 @@ type Provider struct {
 	// Password for authenticating with the Bluecat API
 	Password string `json:"password,omitempty"`
 
-	// Configuration name in Bluecat (optional, defaults to first available)
+	// ConfigurationName is accepted for compatibility but currently ignored:
+	// zone lookups are not filtered by configuration. If a zone name matches
+	// more than one zone (for example, the same zone in two configurations),
+	// the lookup fails with an ambiguity error rather than guessing.
 	ConfigurationName string `json:"configuration_name,omitempty"`
 
-	// View name in Bluecat (optional, defaults to first available)
+	// ViewName limits zone lookups to one DNS view (optional). Without it, a
+	// zone that exists in more than one view fails with an ambiguity error.
 	ViewName string `json:"view_name,omitempty"`
 
 	// DeployDelay is how long to wait after the last record write before
