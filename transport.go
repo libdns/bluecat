@@ -479,19 +479,11 @@ func (c *Client) setCredentials(header string) {
 	c.authGen++
 }
 
-// collection is the Bluecat v2 envelope for a list endpoint. Bluecat has used
-// both "count" and "total" for the total-item field, so accept either.
+// collection is the Bluecat v2 envelope for a list endpoint. Its "count" is
+// the number of items in this page, not the collection total, and there is no
+// total or next link, so a short page is the only end-of-collection signal.
 type collection[T any] struct {
-	Data  []T `json:"data"`
-	Count int `json:"count"`
-	Total int `json:"total"`
-}
-
-func (c collection[T]) total() int {
-	if c.Count > 0 {
-		return c.Count
-	}
-	return c.Total
+	Data []T `json:"data"`
 }
 
 // maxPages guards against a server that ignores offset and returns the same
@@ -531,9 +523,6 @@ func listAll[T any](ctx context.Context, c *Client, path string, query url.Value
 		// A short page means we reached the end. An empty page means the
 		// same, and also protects against a server that ignores offset.
 		if len(resp.Data) < limit {
-			return all, nil
-		}
-		if total := resp.total(); total > 0 && len(all) >= total {
 			return all, nil
 		}
 	}

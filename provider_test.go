@@ -440,7 +440,10 @@ func TestGetResourceRecords_Paginates(t *testing.T) {
 		if offset > total {
 			offset = total
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"data": all[offset:end], "count": total})
+		// Real BAM reports "count" as the size of this page, not the
+		// collection total (observed against production 2026-10-06).
+		page := all[offset:end]
+		writeJSON(w, http.StatusOK, map[string]any{"data": page, "count": len(page)})
 	})
 
 	c := m.Client(t)
